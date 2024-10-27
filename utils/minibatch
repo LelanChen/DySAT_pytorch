@@ -1,1 +1,100 @@
+# encoding: utf-8
+from __future__ import division
+from __future__ import print_function
+
+import numpy as np
+import torch
+from utils.shuffle_node_multi import *
+from config import DefaultConfig
+
+cfg = DefaultConfig
+
+
+class MinibatchIterator(object):
+    """
+    此小批量迭代器循环访问节点，以对一批节点的上下文对进行采样。
+
+    graphs -- list of networkx graphs
+    features -- list of (scipy) sparse node attribute matrices
+    adjs -- list of adj matrices (of the graphs)
+    placeholders -- standard tensorflow placeholders object for feeding
+    num_time_steps -- number of graphs to train +1
+    context_pairs -- list of (target, context) pairs obtained from random walk sampling.
+    batch_size -- size of the minibatches (# nodes)
+    """
+    def __init__(self, graphs, features, adjs, label, classes, num_features, batch_size=100):
+
+        self.graphs = graphs
+        self.features = features
+        self.adjs = adjs
+        self.label = label
+        self.classes = classes
+        # self.placeholders = placeholders
+        self.batch_size = batch_size
+        self.start_time_step = 0  # 每个批次的开始时间
+        self.num_features = num_features  # 节点属性的维度
+        self.num_time_steps = len(graphs)
+        self.node_ids = list(
+            [list(self.graphs[t].nodes()) for t in range(0, self.num_time_steps)])  # all nodes in the graphs.
+        print ("# time steps", len(self.node_ids))
+
+
+    def end(self):
+        return self.start_time_step >= self.num_time_steps
+
+    def batch_feed_dict(self, batch_nodes):
+        """
+        feed -- 字典['node_ids', 'features', 'neighbor_node_features', 'neighbor_edge_features', 'label']
+        包含 （a） 节点id、（b） 属性矩阵列表、（c） 采样邻居节点特征、（d）采样邻居边缘特征、（e）标签的 feed dict"""
+
+        min_t = max(0, self.start_time_step - cfg.window)   # min_t = max_t - window + 1
+        # print('min_t', min_t)
+        max_t = self.start_time_step - 1   # max_t其实就是当前快照所在的时隙
+        # print('max_t', max_t)
+        feed_dict = dict()
+        assert len(batch_nodes) == len(self.label[self.start_time_step - 1])
+        print('num of node:', len(batch_nodes))
+
+        feat = np.zeros((cfg.window, len(batch_nodes), self.num_features))  # 初始化节点特征列表[T, N, S]
+        adjs = np.zeros((cfg.window, len(batch_nodes), len(batch_nodes)))
+        index = 0
+        for node in batch_nodes:
+            for t in range(min_t, max_t + 1):
+                adjs[t - min_t] = self.adjs[t]
+                if node in self.node_ids[t]:
+                    feat[t - min_t][index] = self.features[t][node]  # [T, N, S]
+            index = index + 1
+        feed_dict.update({'node': batch_nodes})
+        feed_dict.update({'label': torch.IntTensor(self.label[self.start_time_step - 1])})
+        # print('shape of batch label',feed_dict['label'].size())
+        feed_dict.update({'classes': torch.from_numpy(np.array(self.classes[self.start_time_step - 1]))})
+        feed_dict.update({'features': torch.from_numpy(feat).float()})
+        feed_dict.update({'adjs': torch.from_numpy(adjs).float()})
+        return feed_dict
+
+
+    def next_minibatch_feed_dict(self):
+        """
+        生成器函数，用于生成各个时刻快照的小批次。一个快照的节点当作一个batch.
+        self.node_ids (list): 所有时刻的节点ID列表，维度为[T, N_t]，T表示时间快照数量，N_t表示每个时刻的节点数量（N_t不一致）。
+        返回:
+        batche (generator): 生成器，每次生成一个小批次
+        feed_dict:
+        """
+        batch = []
+        # 填充当前批次
+        batch.extend(self.node_ids[self.start_time_step])
+        # print(self.start_time_step)
+        # print(len(batch))
+        self.start_time_step = self.start_time_step + 1
+        return self.batch_feed_dict(batch)
+
+    def shuffle(self):
+        """ Re-shuffle the training set.
+            Also reset the batch number.
+        """
+        self.node_ids, self.label, self.adjs, self.classes = shuffle_node(self.node_ids, self.label, self.adjs,
+                                                                          self.classes)
+        self.start_time_step = 0
+
 
