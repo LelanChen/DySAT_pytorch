@@ -1,1 +1,231 @@
+# encoding: utf-8
+
+import torch
+import torch.nn as nn
+from config import DefaultConfig
+import torch.nn.functional as F
+
+cfg = DefaultConfig
+
+
+class TemporalAttentionLayer(nn.Module):
+    """ 输入参数 num_time_steps 设置为训练快照总数 +1 。"""
+    def __init__(self, input_dim, n_heads, num_time_steps, attn_drop, residual=False, bias=True,
+                 use_position_embedding=True):
+        super(TemporalAttentionLayer, self).__init__()
+
+        self.bias = bias
+        self.n_heads = n_heads
+        self.num_time_steps = num_time_steps
+        # print("num_time_steps: ", num_time_steps)
+        self.attn_drop = attn_drop
+        self.attn_wts_means = []
+        self.attn_wts_vars = []
+        self.residual = residual
+        self.input_dim = input_dim
+        # self.Wq = nn.Conv1d(in_channels=self.input_dim, out_channels=self.input_dim,
+        #                     kernel_size=1, bias=False)
+        # self.Wk = nn.Conv1d(in_channels=self.input_dim, out_channels=self.input_dim,
+        #                     kernel_size=1, bias=False)
+        # self.Wv = nn.Conv1d(in_channels=self.input_dim, out_channels=self.input_dim,
+        #                     kernel_size=1, bias=False)
+        self.use_position_embedding = use_position_embedding
+        self.position_embeddings = None
+        self.Wq = None
+        self.Wk = None
+        self.Wv = None
+        self.conv1d_layer = nn.Conv1d(in_channels=self.input_dim, out_channels=self.input_dim, kernel_size=1)
+        # xavier_init = nn.init.xavier_uniform_  # 权重初始化
+        # if use_position_embedding:
+        #     self.position_embeddings = nn.Parameter(torch.empty(self.num_time_steps, self.input_dim),
+        #                                             requires_grad=True)  # [T, F]
+        #     xavier_init(self.position_embeddings)
+        self.build()
+
+
+    # 创建层对象
+    def build(self):
+        xavier_init = nn.init.xavier_normal_  # 初始化方法
+        if self.use_position_embedding:
+            if not self.position_embeddings:
+                self.position_embeddings = nn.Parameter(torch.empty(self.num_time_steps, self.input_dim))  # 创建可学习的参数[T, F]
+                xavier_init(self.position_embeddings)  # 使用 Xavier 初始化方法初始化参数
+        if not self.Wq:
+            self.Wq = nn.Parameter(torch.empty(self.input_dim, self.input_dim))
+            xavier_init(self.Wq)
+        if not self.Wk:
+            self.Wk = nn.Parameter(torch.empty(self.input_dim, self.input_dim))
+            xavier_init(self.Wk)
+        if not self.Wv:
+            self.Wv = nn.Parameter(torch.empty(self.input_dim, self.input_dim))
+            xavier_init(self.Wv)
+
+    def forward(self, inputs):
+        """ In:  attn_outputs (of StructuralAttentionLayer at each snapshot):= [N, T, F]."""
+        # 1: Add position embeddings to input
+        position_inputs = torch.tile(torch.arange(inputs.size(1)).unsqueeze(0), [inputs.size(0), 1])    # [N, T]
+        temporal_inputs = inputs + self.position_embeddings[position_inputs]  # [N, T, F]
+
+        # 2: Query, Key based multi-head self attention. tf.tnsordot函数用于矩阵相乘
+        q = torch.tensordot(temporal_inputs, self.Wq, dims=([2], [0]))  # [N, T, F]
+        k = torch.tensordot(temporal_inputs, self.Wk, dims=([2], [0]))  # [N, T, F]
+        v = torch.tensordot(temporal_inputs, self.Wv, dims=([2], [0]))  # [N, T, F]
+        # q = self.Wq(temporal_inputs.permute(0, 2, 1))
+        # q = q.permute(0, 2, 1)
+        # k = self.Wk(temporal_inputs.permute(0, 2, 1))
+        # k = k.permute(0, 2, 1)
+        # v = self.Wv(temporal_inputs.permute(0, 2, 1))
+        # v = v.permute(0, 2, 1)
+
+        # 3: Split, concat and scale.
+        q_ = torch.cat(torch.chunk(q, self.n_heads, dim=2), dim=0)  # [hN, T, F/h]
+        k_ = torch.cat(torch.chunk(k, self.n_heads, dim=2), dim=0)  # [hN, T, F/h]
+        v_ = torch.cat(torch.chunk(v, self.n_heads, dim=2), dim=0)  # [hN, T, F/h]
+
+        outputs = torch.matmul(q_, k_.transpose(1, 2))  # [hN, T, T]，tf.transpose转置函数
+        outputs = outputs / (self.num_time_steps ** 0.5)
+
+        # 4: Masked (causal) softmax to compute attention weights.
+
+        diag_val = torch.ones_like(outputs[0, :, :])  # [T, T] # 创建一个与输入元素维度一样，参数都为1的张量
+        tril = torch.tril(diag_val)  # [T, T],下三角矩阵
+        masks = torch.tile(tril.unsqueeze(0), [outputs.size(0), 1, 1])  # [hN, T, T]
+        padding = torch.ones_like(masks) * (-2 ** 32 + 1)
+        outputs = torch.where(masks == 0, padding, outputs)  # [h*N, T, T]
+        outputs = F.softmax(outputs, dim=-1)  # Masked attention.
+        self.attn_wts_all = outputs
+
+        # 5: Dropout on attention weights.
+        # outputs = nn.Dropout(self.attn_drop)(outputs)
+        outputs = torch.matmul(outputs, v_)  # [hN, T, C/h]
+
+        split_outputs = torch.chunk(outputs, self.n_heads, dim=0)
+        outputs = torch.cat(split_outputs, dim=-1)
+
+        # Optional: Feedforward and residual
+        if cfg.position_ffn:
+            outputs = self.feedforward(outputs)
+
+        if self.residual:
+            outputs = outputs + temporal_inputs
+
+        return outputs
+
+    def feedforward(self, inputs):
+        """Point-wise feed forward net.
+
+        Args:
+          inputs: A 3d tensor with shape of [N, T, C].
+          reuse: 布尔值，表示是否重复使用上一层的权重。
+
+        Returns:
+          A 3d tensor with the same shape and dtype as inputs
+        """
+        outputs = self.conv1d_layer(inputs.permute(0, 2, 1))
+        outputs = F.relu(outputs.permute(0, 2, 1))
+
+        outputs = outputs + inputs
+        # print('shape of temporal att out', outputs.size())
+        return outputs
+
+
+class StructuralAttentionLayer(nn.Module):
+    def __init__(self, input_dim, output_dim, n_heads, attn_drop, ffd_drop, residual=False,
+                 bias=True, sparse_inputs=False):
+        super(StructuralAttentionLayer, self).__init__()
+        self.attn_drop = attn_drop
+        self.ffd_drop = ffd_drop
+        self.bias = bias
+        self.n_heads = n_heads
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.residual = residual
+        self.sparse_inputs = sparse_inputs
+        self.x_conv1d_layer = nn.ModuleList()
+        self.f1_conv1d_layer = nn.ModuleList()
+        self.f2_conv1d_layer = nn.ModuleList()
+        # print("input_dim:", input_dim)
+        for j in range(self.n_heads):
+            self.x_conv1d_layer.append(nn.Conv1d(in_channels=self.input_dim, out_channels=self.output_dim // self.n_heads, kernel_size=1))
+            self.f1_conv1d_layer.append(nn.Conv1d(in_channels=self.output_dim // self.n_heads, out_channels=1, kernel_size=1))
+            self.f2_conv1d_layer.append(nn.Conv1d(in_channels=self.output_dim // self.n_heads, out_channels=1, kernel_size=1))
+        self.conv1d_layer = nn.Conv1d(in_channels=self.input_dim, out_channels=self.output_dim // self.n_heads, kernel_size=1, bias=False)
+
+    def forward(self, inputs):
+        x = inputs[0]
+        adj = inputs[1]
+        attentions = []
+        for j in range(self.n_heads):
+            attentions.append(self.sp_attn_head(x, adj_mat=adj, num_head=j, in_sz=self.input_dim,
+                                                out_sz=self.output_dim // self.n_heads,
+                                                in_drop=self.ffd_drop, coef_drop=self.attn_drop, residual=self.residual,
+                                                sparse_inputs=self.sparse_inputs))
+
+        h = torch.cat(attentions, dim=-1)
+        # print("shape of structural att hidden", h.size())
+        return h
+
+    @staticmethod
+    def leaky_relu(features, alpha=0.2):
+        return torch.max(alpha * features, features)
+
+    def sp_attn_head(self, seq, in_sz, out_sz, adj_mat, num_head, in_drop=0.0, coef_drop=0.0, residual=False
+                     , sparse_inputs=False):
+        """ GAT层的稀疏注意头。注意：变量范围是必要的，以避免变量在快照中的重复"""
+
+        if sparse_inputs:
+            weight_var = torch.nn.Parameter(torch.randn(in_sz, out_sz))
+            seq_fts = torch.unsqueeze(torch.matmul(seq, weight_var), dim=0)  # [N, F]
+        else:
+            seq = torch.unsqueeze(seq, dim=0)   # [1, N, F]
+            # print('size of seq: ', seq_fts.size())
+            seq_fts = self.x_conv1d_layer[num_head](seq.permute(0, 2, 1))
+            seq_fts = seq_fts.permute(0, 2, 1)
+            # print('size of seq: ', seq_fts.size())
+
+            # Additive self-attention.
+            # f_1 = tf.compat.v1.layers.conv1d(seq_fts, 1, 1, name='layer_' + str(layer_str) + '_a1', reuse=reuse_scope)
+            # f_2 = tf.compat.v1.layers.conv1d(seq_fts, 1, 1, name='layer_' + str(layer_str) + '_a2', reuse=reuse_scope)
+            f_1 = self.f1_conv1d_layer[num_head](seq_fts.permute(0, 2, 1))
+            f_1 = f_1.permute(0, 2, 1)
+            # print('size of f_1: ', f_1.size())
+            f_2 = self.f2_conv1d_layer[num_head](seq_fts.permute(0, 2, 1))
+            f_2 = f_2.permute(0, 2, 1)
+            # print('size of f_2: ', f_2.size())
+            f_1 = f_1.view(-1, 1)  # [N, 1]
+            f_2 = f_2.view(-1, 1)  # [N, 1]
+
+            logits = torch.add(torch.mul(adj_mat, f_1), torch.mul(adj_mat, f_2.t()))  # adj_mat is [N, N] (sparse)
+            # print('size of logits: ', logits.size())
+            # leaky_relu = self.leaky_relu(logits)
+            leaky_relu = F.leaky_relu(logits)
+            coefficients = F.softmax(leaky_relu, dim=-1)  # [N, N] (sparse)
+
+            # if coef_drop != 0.0:
+            #     coefficients = nn.Dropout(coef_drop)(coefficients)
+            # if in_drop != 0.0:
+            #     seq_fts = nn.Dropout(in_drop)(seq_fts)  # [N,  F]
+
+            seq_fts = torch.squeeze(seq_fts)  # 默认删除所有为1的维度
+            # print('size of seq_fts: ', seq_fts.size())
+            # print('size of coefficients: ', coefficients.size())
+            values = torch.matmul(coefficients, seq_fts)
+            # print('size of values: ', values.size())
+            values = values.view(-1, out_sz)
+            # print('size of values: ', values.size())
+            ret = values  # [N, F]
+
+            if residual:
+                residual_wt = nn.Parameter(torch.randn(in_sz, out_sz))
+                if sparse_inputs:
+                    ret = ret + torch.unsqueeze(torch.matmul(seq, residual_wt),
+                                               dim=0)  # [N, F] * [F, D] = [N, D].
+                else:
+                    # ret = ret + tf.compat.v1.layers.conv1d(seq, out_sz, 1, use_bias=False,
+                    #                              name='layer_' + str(layer_str) + '_residual_weight', reuse=reuse_scope)
+                    # print("shape of seq", seq.permute(0, 2, 1).size())
+                    ret = self.conv1d_layer(seq.permute(0, 2, 1))
+                    ret = values + ret.permute(0, 2, 1).view(-1, out_sz)
+                    # print("shape of ret", ret.size())
+            return F.relu(ret)
 
